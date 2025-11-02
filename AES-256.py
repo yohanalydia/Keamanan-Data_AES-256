@@ -27,6 +27,9 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 # untuk enkripsi key (key wrapping) menggunakan AES-GCM (autentikasi data)
 
+from cryptography.exceptions import InvalidTag
+# untuk menangani kesalahan password
+import struct                            # untuk konversi antara bytes ke int dan sebaliknya
 import base64                            # encoding/decoding base64
 import os                                # membuat byte acak untuk IV/key
 import io                                # membaca file di memori (tanpa disimpan ke disk)
@@ -60,7 +63,13 @@ def unwrap_key_with_password(wrapped_blob: bytes, password: str) -> bytes:
     kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=200_000)
     kek = kdf.derive(password.encode())
     aesgcm = AESGCM(kek)
-    return aesgcm.decrypt(nonce, wrapped, associated_data=None)
+
+    # Menanganikesalahan password/data korup secara spesifik
+    try:
+        return aesgcm.decrypt(nonce, wrapped, associated_data=None)
+    except InvalidTag:
+        raise InvalidTag("Gagal unwrap key: password salah atau file .wkey rusak.")
+
 
 # ============================================================
 # Fungsi AES-256 CBC Encrypt/Decrypt
@@ -88,6 +97,24 @@ def aes_decrypt_cbc(key: bytes, data: bytes) -> bytes:
     unpadder = padding.PKCS7(128).unpadder()
     plaintext = unpadder.update(padded_plaintext) + unpadder.finalize()
     return plaintext
+
+
+# Fungsi tambahan untuk menyimpan dan mengambil nama file asli
+def embed_filename(original_name: str, encrypted_data: bytes) -> bytes:
+    """Sisipkan panjang dan nama file di awal data terenkripsi."""
+    name_bytes = original_name.encode('utf-8')
+    name_len = struct.pack('>H', len(name_bytes))  # 2-byte big-endian length
+    return name_len + name_bytes + encrypted_data
+
+def extract_filename(blob: bytes):
+    """Ambil nama file asli dan data terenkripsi dari blob."""
+    if len(blob) < 2:
+        return None, blob
+    name_len = struct.unpack('>H', blob[:2])[0]
+    name = blob[2:2+name_len].decode('utf-8', errors='ignore')
+    data = blob[2+name_len:]
+    return name, data
+
 
 # ============================================================
 # STREAMLIT UI
@@ -134,8 +161,11 @@ if uploaded_wrap and st.sidebar.button("🔓 Pulihkan Key dari .wkey"):
         restored_key = unwrap_key_with_password(data, unwrap_password)
         st.session_state["aes_key"] = restored_key
         st.sidebar.success("✅ Key berhasil dipulihkan dan diaktifkan!")
+    except InvalidTag as e:
+        st.sidebar.error(str(e)) 
     except Exception as e:
         st.sidebar.error(f"Gagal unwrap key: {e}")
+
 
 # TAB ENKRIPSI & DEKRIPSI
 tab1, tab2 = st.tabs(["🧾 Enkripsi", "📂 Dekripsi"])
@@ -158,9 +188,13 @@ with tab1:
             try:
                 file_data = uploaded_file.read()
                 encrypted_data = aes_encrypt_cbc(key, file_data)
+
+                # Menyimpan nama file asli di dalam hasil enkripsi
+                blob = embed_filename(uploaded_file.name, encrypted_data)
+
                 st.download_button(
                     "💾 Download File Terenkripsi (.bin)",
-                    encrypted_data,
+                    blob,
                     file_name=f"{uploaded_file.name}.bin",
                     mime="application/octet-stream"
                 )
@@ -187,14 +221,18 @@ with tab2:
         uploaded_enc = st.file_uploader("Upload file terenkripsi (.bin)", type=["bin"])
         if uploaded_enc and st.button("🔓 Dekripsi File"):
             try:
-                decrypted_data = aes_decrypt_cbc(key, uploaded_enc.read())
+                # Mengambil nama file asli sebelum dekripsi
+                file_name, file_data = extract_filename(uploaded_enc.read())
+                decrypted_data = aes_decrypt_cbc(key, file_data)
+                out_name = file_name if file_name else "decrypted_output"
+
                 st.download_button(
                     "💾 Download File Hasil Dekripsi",
                     decrypted_data,
-                    file_name="decrypted_output",
+                    file_name=out_name,
                     mime="application/octet-stream"
                 )
-                st.success("✅ File berhasil didekripsi! Ganti ekstensi sesuai file asli (misal .pdf, .jpg, .xlsx).")
+                st.success(f"✅ File berhasil didekripsi! (nama asli: {out_name})")
             except Exception as e:
                 st.error(f"Gagal mendekripsi: {e}")
 
@@ -209,7 +247,7 @@ st.info("""
 - Mode **CBC** memastikan pola plaintext tidak muncul pada ciphertext.
 - Fitur **Key Wrapping** memungkinkan kunci dibagikan aman dengan password. Pengguna yang tidak memiliki password tidak bisa membuka kunci.
 - File terenkripsi disimpan sebagai `.bin`.
-- Setelah dekripsi, ubah nama/ekstensi file sesuai jenis aslinya:
+- Setelah dekripsi, ekstensi file akan sesuai jenis aslinya:
   - `.pdf`, `.jpg`, `.png`, `.csv`, `.xlsx`, dll.
 - File CSV/XLSX bisa langsung dibuka di Excel setelah didekripsi.
 - File gambar atau PDF **tidak bisa ditampilkan langsung di Streamlit**, tapi bisa disimpan dan dibuka manual setelah didekripsi.
